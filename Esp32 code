@@ -1,0 +1,55 @@
+// ESP32 code
+
+const int OCCUPIED_IN    = 4;   // from Arduino Mega ESP_OCCUPIED_OUT (use level shifting!)
+const int NAV_REQUEST_OUT = 5;  // to Arduino Mega ESP_NAV_REQUEST_IN
+
+const int RED_LED_ESP    = 16;
+const int GREEN_LED_ESP  = 17;
+
+const int BLIND_NAV_BTN  = 0;   // with INPUT_PULLUP
+
+bool lastButtonState = HIGH;
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(OCCUPIED_IN, INPUT);
+  pinMode(NAV_REQUEST_OUT, OUTPUT);
+
+  pinMode(RED_LED_ESP, OUTPUT);
+  pinMode(GREEN_LED_ESP, OUTPUT);
+
+  pinMode(BLIND_NAV_BTN, INPUT_PULLUP);
+
+  digitalWrite(NAV_REQUEST_OUT, LOW);
+}
+
+void loop() {
+  // Read occupancy from Mega
+  int occ = digitalRead(OCCUPIED_IN);
+  if (occ == HIGH) {
+    // Room occupied -> RED
+    digitalWrite(RED_LED_ESP, HIGH);
+    digitalWrite(GREEN_LED_ESP, LOW);
+  } else {
+    // Room free -> GREEN
+    digitalWrite(RED_LED_ESP, LOW);
+    digitalWrite(GREEN_LED_ESP, HIGH);
+  }
+
+  // Blind navigation button
+  bool currentButton = digitalRead(BLIND_NAV_BTN);
+  if (lastButtonState == HIGH && currentButton == LOW) {
+    // Button pressed: send a short pulse to Mega
+    Serial.println("Blind navigation requested (outside)");
+    digitalWrite(NAV_REQUEST_OUT, HIGH);
+    delay(100);
+    digitalWrite(NAV_REQUEST_OUT, LOW);
+  }
+  lastButtonState = currentButton;
+
+  // Here you can also broadcast occ status via WiFi / BLE to mobile app
+  // e.g., send MQTT, HTTP, WebSocket, etc.
+
+  delay(50);
+}
