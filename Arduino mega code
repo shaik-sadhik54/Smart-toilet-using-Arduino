@@ -1,0 +1,311 @@
+#include <SoftwareSerial.h>
+#include <DFRobotDFPlayerMini.h>
+
+// ---------- PIN DEFINITIONS ----------
+const int RED_LED            = 22;
+const int GREEN_LED          = 23;
+
+const int RELAY_SOLENOID_LOCK = 24;
+const int RELAY_PUMP_COMMODE  = 25;
+const int RELAY_PUMP_FULL     = 26;
+
+const int ENTR_TRIG = 30;
+const int ENTR_ECHO = 31;
+
+const int COM_TRIG  = 32;
+const int COM_ECHO  = 33;
+
+const int SOS_BUTTON        = 34; // INPUT_PULLUP
+const int NAV_BUTTON_INSIDE = 35; // INPUT_PULLUP
+
+const int ESP_OCCUPIED_OUT   = 40; // OUTPUT to ESP32
+const int ESP_NAV_REQUEST_IN = 41; // INPUT from ESP32 button
+
+// MP3 (DFPlayer)
+const int MP3_RX = 10;  // Mega RX <- DFPlayer TX
+const int MP3_TX = 11;  // Mega TX -> DFPlayer RX
+SoftwareSerial mp3Serial(MP3_RX, MP3_TX);
+DFRobotDFPlayerMini mp3;
+
+// GSM (use Serial1 on Mega)
+#define gsmSerial Serial1
+const char POLICE_NUMBER[] = "+911234567890"; // <-- change to real number
+
+// ---------- LOGIC CONSTANTS ----------
+const long ENTRY_LOCK_DELAY_MS        = 5000;   // 5s after entering
+const long COMMODE_UNLOCK_DELAY_MS    = 5000;   // 5s after leaving commode
+const long PUMP_COMMODE_DURATION_MS   = 30000;  // 30s
+const long PUMP_FULL_DURATION_MS      = 30000;  // 30s
+
+const int PERSON_DISTANCE_THRESHOLD_CM = 80;    // adjust as needed
+
+// ---------- STATE VARIABLES ----------
+enum ToiletState {
+  IDLE,              // nobody inside, door free
+  WAITING_ENTRY,     // person detected at door, waiting to lock after entry
+  OCCUPIED,          // person inside
+  READY_TO_EXIT,     // commode finished, door unlocked & partial cleaning done
+  EXIT_CLEANING      // person leaving, full cleaning running
+};
+
+ToiletState state = IDLE;
+
+bool commodeOccupied      = false;
+bool lastCommodeOccupied  = false;
+
+unsigned long entryDetectedTime        = 0;
+unsigned long commodeLeftTime          = 0;
+unsigned long pumpCommodeStartTime     = 0;
+unsigned long pumpFullStartTime        = 0;
+
+bool pumpCommodeRunning = false;
+bool pumpFullRunning    = false;
+
+bool sosLastState = HIGH;
+bool navInsideLastState = HIGH;
+bool navEspLastState    = HIGH;
+
+// ---------- HELPER FUNCTIONS ----------
+
+long readUltrasonicCM(int trigPin, int echoPin) {
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+
+  long duration = pulseIn(echoPin, HIGH, 30000UL); // timeout 30ms
+  if (duration == 0) return 999; // no echo
+  long distance = duration / 58; // approx cm
+  return distance;
+}
+
+void lockDoor(bool locked) {
+  // Assuming relay LOW = OFF, HIGH = ON (adjust if opposite)
+  digitalWrite(RELAY_SOLENOID_LOCK, locked ? HIGH : LOW);
+}
+
+void setOccupiedIndicator(bool occupied) {
+  if (occupied) {
+    digitalWrite(RED_LED, HIGH);
+    digitalWrite(GREEN_LED, LOW);
+    digitalWrite(ESP_OCCUPIED_OUT, HIGH); // inform ESP32
+  } else {
+    digitalWrite(RED_LED, LOW);
+    digitalWrite(GREEN_LED, HIGH);
+    digitalWrite(ESP_OCCUPIED_OUT, LOW);
+  }
+}
+
+void startCommodePump() {
+  pumpCommodeRunning = true;
+  pumpCommodeStartTime = millis();
+  digitalWrite(RELAY_PUMP_COMMODE, HIGH);
+}
+
+void stopCommodePump() {
+  pumpCommodeRunning = false;
+  digitalWrite(RELAY_PUMP_COMMODE, LOW);
+}
+
+void startFullPump() {
+  pumpFullRunning = true;
+  pumpFullStartTime = millis();
+  digitalWrite(RELAY_PUMP_FULL, HIGH);
+}
+
+void stopFullPump() {
+  pumpFullRunning = false;
+  digitalWrite(RELAY_PUMP_FULL, LOW);
+}
+
+void sendSMS(const char* number, const char* text) {
+  gsmSerial.println("AT+CMGF=1");
+  delay(1000);
+  gsmSerial.print("AT+CMGS=\"");
+  gsmSerial.print(number);
+  gsmSerial.println("\"");
+  delay(1000);
+  gsmSerial.print(text);
+  delay(500);
+  gsmSerial.write(26); // CTRL+Z
+  delay(3000);
+}
+
+void handleSOS() {
+  bool current = digitalRead(SOS_BUTTON);
+  if (sosLastState == HIGH && current == LOW) {
+    // button pressed
+    for (int i = 0; i < 3; i++) {
+      sendSMS(POLICE_NUMBER, "SMART TOILET SOS: Immediate help needed.");
+    }
+  }
+  sosLastState = current;
+}
+
+void playNavigationMessage() {
+  // Example:
+  // Track 1: "Walk 5 steps straight to reach the commode"
+  // Track 2: "SOS button is on your right side near the wall"
+  // You must load these audio files to DFPlayer SD card as 0001.mp3, 0002.mp3 etc.
+
+  mp3.play(1);
+  delay(4000); // wait a bit between messages (rough, adjust)
+  mp3.play(2);
+}
+
+void handleNavigationRequests() {
+  // Inside button
+  bool navInside = digitalRead(NAV_BUTTON_INSIDE);
+  if (navInsideLastState == HIGH && navInside == LOW) {
+    playNavigationMessage();
+  }
+  navInsideLastState = navInside;
+
+  // ESP32 outside button request
+  bool navEsp = digitalRead(ESP_NAV_REQUEST_IN);
+  if (navEspLastState == LOW && navEsp == HIGH) {
+    // rising edge from ESP32
+    playNavigationMessage();
+  }
+  navEspLastState = navEsp;
+}
+
+// ---------- SETUP ----------
+void setup() {
+  pinMode(RED_LED, OUTPUT);
+  pinMode(GREEN_LED, OUTPUT);
+
+  pinMode(RELAY_SOLENOID_LOCK, OUTPUT);
+  pinMode(RELAY_PUMP_COMMODE, OUTPUT);
+  pinMode(RELAY_PUMP_FULL, OUTPUT);
+
+  pinMode(ENTR_TRIG, OUTPUT);
+  pinMode(ENTR_ECHO, INPUT);
+  pinMode(COM_TRIG, OUTPUT);
+  pinMode(COM_ECHO, INPUT);
+
+  pinMode(SOS_BUTTON, INPUT_PULLUP);
+  pinMode(NAV_BUTTON_INSIDE, INPUT_PULLUP);
+
+  pinMode(ESP_OCCUPIED_OUT, OUTPUT);
+  pinMode(ESP_NAV_REQUEST_IN, INPUT);
+
+  digitalWrite(RELAY_SOLENOID_LOCK, LOW);
+  digitalWrite(RELAY_PUMP_COMMODE, LOW);
+  digitalWrite(RELAY_PUMP_FULL, LOW);
+
+  // Serial for debug
+  Serial.begin(9600);
+
+  // GSM init
+  gsmSerial.begin(9600);
+
+  // MP3 init
+  mp3Serial.begin(9600);
+  if (!mp3.begin(mp3Serial)) {
+    Serial.println("DFPlayer error");
+  } else {
+    mp3.volume(25); // 0-30
+  }
+
+  // Start in IDLE
+  state = IDLE;
+  lockDoor(false);            // door unlocked
+  setOccupiedIndicator(false); // GREEN
+}
+
+// ---------- LOOP ----------
+void loop() {
+  unsigned long now = millis();
+
+  // Read sensors
+  long entrDist = readUltrasonicCM(ENTR_TRIG, ENTR_ECHO);
+  long comDist  = readUltrasonicCM(COM_TRIG, COM_ECHO);
+
+  lastCommodeOccupied = commodeOccupied;
+  commodeOccupied = (comDist < PERSON_DISTANCE_THRESHOLD_CM);
+
+  // Handle SOS and navigation every loop
+  handleSOS();
+  handleNavigationRequests();
+
+  // Handle pumps timing
+  if (pumpCommodeRunning && (now - pumpCommodeStartTime >= PUMP_COMMODE_DURATION_MS)) {
+    stopCommodePump();
+  }
+  if (pumpFullRunning && (now - pumpFullStartTime >= PUMP_FULL_DURATION_MS)) {
+    stopFullPump();
+    // After full clean, return to IDLE state
+    if (state == EXIT_CLEANING) {
+      state = IDLE;
+      lockDoor(false);
+      setOccupiedIndicator(false);
+    }
+  }
+
+  // ---------- STATE MACHINE ----------
+  switch (state) {
+
+    case IDLE:
+      // waiting for someone at entrance while free
+      setOccupiedIndicator(false);
+      lockDoor(false); // door unlocked
+
+      if (entrDist < PERSON_DISTANCE_THRESHOLD_CM) {
+        // Person detected at door
+        state = WAITING_ENTRY;
+        entryDetectedTime = now;
+      }
+      break;
+
+    case WAITING_ENTRY:
+      // Person is at entrance; after some time, lock door (person presumably inside)
+      if (now - entryDetectedTime >= ENTRY_LOCK_DELAY_MS) {
+        lockDoor(true);          // lock the door after person goes in
+        state = OCCUPIED;
+        setOccupiedIndicator(true); // RED, occupied
+      }
+      break;
+
+    case OCCUPIED:
+      // Person is inside; when they leave commode, start timer
+      if (lastCommodeOccupied && !commodeOccupied) {
+        // just left commode
+        commodeLeftTime = now;
+      }
+
+      // After leaving commode and 5 seconds, unlock door & start commode pump
+      if (!commodeOccupied && (now - commodeLeftTime >= COMMODE_UNLOCK_DELAY_MS) && commodeLeftTime != 0) {
+        lockDoor(false); // allow them to exit
+        if (!pumpCommodeRunning) startCommodePump();
+        state = READY_TO_EXIT;
+      }
+      break;
+
+    case READY_TO_EXIT:
+      // Door is unlocked, partial cleaning running; wait until person goes to door
+      if (entrDist < PERSON_DISTANCE_THRESHOLD_CM) {
+        // They are at the door, going out
+        lockDoor(true); // briefly lock during full cleaning
+        if (!pumpFullRunning) startFullPump();
+        state = EXIT_CLEANING;
+      }
+      break;
+
+    case EXIT_CLEANING:
+      // Pump running, after finish we set back to IDLE in pumpFull timing part
+      break;
+  }
+
+  // Debug
+  /*
+  Serial.print("State: "); Serial.print(state);
+  Serial.print(" EntrDist: "); Serial.print(entrDist);
+  Serial.print(" ComDist: "); Serial.print(comDist);
+  Serial.print(" ComOcc: "); Serial.print(commodeOccupied);
+  Serial.println();
+  */
+
+  delay(100); // small delay
+}
